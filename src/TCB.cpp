@@ -1,5 +1,5 @@
 #include "../headers/TCB.h"
-
+//bah
 TCB::TCB(const Tarefa& tarefa)
     : tarefa(tarefa),
       estado(EstadoTarefa::suspensa),
