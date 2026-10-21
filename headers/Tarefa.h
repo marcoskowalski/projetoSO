@@ -5,18 +5,23 @@
 #ifndef PROJETOSO_TAREFA_H
 #define PROJETOSO_TAREFA_H
 
-
+// Parâmetros ESTÁTICOS de uma tarefa, exatamente como vieram do arquivo de
+// configuração. O estado que muda durante a simulação (tempo restante,
+// prazo absoluto, CPU...) fica no TCB, não aqui.
+//
+// Os membros têm valor inicial para que o construtor padrão nunca deixe lixo
+// de memória (antes, Tarefa() = default deixava os campos sem inicializar).
 class Tarefa
 {
      private:
-        int id;
-        int periodo;
-        int ingresso;
-        int duracao;
-        int prazo;
-        unsigned int cor;
+        int id = 0;
+        int periodo = 0;
+        int ingresso = 0;
+        int duracao = 0;
+        int prazo = 0;
+        unsigned int cor = 0;   // 0xRRGGBB
     public:
-        Tarefa(int id, int periodo, int ingresso, int duracao, int prazo, int cor);
+        Tarefa(int id, int periodo, int ingresso, int duracao, int prazo, unsigned int cor);
         Tarefa();
         ~Tarefa();
 

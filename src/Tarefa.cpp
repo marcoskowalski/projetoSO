@@ -6,7 +6,7 @@
 
 Tarefa::Tarefa() = default;
 Tarefa::Tarefa(int id, int periodo, int ingresso,
-                int duracao, int prazo, int cor)
+                int duracao, int prazo, unsigned int cor)
     : id(id),
     periodo(periodo),
     ingresso(ingresso),

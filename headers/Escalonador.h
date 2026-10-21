@@ -38,6 +38,11 @@ class Escalonador
         // 'candidatas' deve conter as tarefas PRONTA e EXECUTANDO (fila global).
         ResultadoEscalonamento escolher(const std::vector<TCB*>& candidatas, int numCpus);
 
+        // Reinicia o gerador do sorteio. O Simulador chama isto a cada tick com
+        // (semente + tick), então o sorteio daquele tick é sempre o mesmo: ao
+        // retroceder e avançar de novo o gantt não muda (requisito 1.5.2).
+        void semear(unsigned int semente);
+
         // Menor valor = mais prioritária.
         [[nodiscard]] virtual int prioridade(const TCB& tcb) const = 0;
         [[nodiscard]] virtual std::string nome() const = 0;

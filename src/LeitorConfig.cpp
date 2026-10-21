@@ -195,10 +195,42 @@ void LeitorConfig::lerTarefa(const std::string& linha, int numLinha)
     unsigned int cor = 0;
 
     // --- id (inteiro, único) ---
+    // Vale para qualquer tarefa, inclusive as que serão ignoradas abaixo:
+    // os ids do arquivo precisam ser únicos de qualquer jeito.
+    bool idOk = true;
     if (!paraInt(c[0], id) || id < 0)
+    {
         erros.push_back(prefixo(numLinha) + "id '" + c[0] + "' inválido (inteiro >= 0).");
+        idOk = false;
+    }
     else if (idsLidos.count(id))
+    {
         erros.push_back(prefixo(numLinha) + "id " + std::to_string(id) + " repetido.");
+        idOk = false;
+    }
+
+    // --- periodo é lido ANTES dos outros campos ---
+    // Uma tarefa aperiódica (periodo 0) só existe no Projeto B. No Projeto A
+    // ela deve ser IGNORADA com um aviso (requisito 4.4), então o resto da
+    // linha (prazo, duração...) não pode gerar erro: antes, "3;0000FF;0;1;0;0"
+    // era rejeitado porque o prazo 0 era validado antes desta checagem.
+    const bool periodoOk = paraInt(c[4], periodo);
+    if (periodoOk && periodo == 0)
+    {
+        if (idOk)
+        {
+            idsLidos.insert(id);   // o id continua "ocupado", mesmo ignorada
+            avisos.push_back(prefixo(numLinha) + "tarefa " + std::to_string(id) +
+                             " é aperiódica (periodo 0) e foi ignorada (só é tratada no Projeto B).");
+        }
+        return;
+    }
+
+    if (!periodoOk)
+        erros.push_back(prefixo(numLinha) + "periodo '" + c[4] + "' inválido (inteiro).");
+    else if (periodo < 0)
+        erros.push_back(prefixo(numLinha) + "periodo negativo é erro no arquivo (periodo = " +
+                        c[4] + ").");
 
     // --- cor (RRGGBB em hexadecimal) ---
     if (!corValida(c[1]))
@@ -206,13 +238,11 @@ void LeitorConfig::lerTarefa(const std::string& linha, int numLinha)
     else
         std::from_chars(c[1].data(), c[1].data() + 6, cor, 16);
 
-    // --- campos numéricos ---
+    // --- demais campos numéricos ---
     if (!paraInt(c[2], ingresso) || ingresso < 0)
         erros.push_back(prefixo(numLinha) + "ingresso '" + c[2] + "' inválido (inteiro >= 0).");
     if (!paraInt(c[3], duracao) || duracao < 1)
         erros.push_back(prefixo(numLinha) + "duracao '" + c[3] + "' inválida (inteiro >= 1).");
-    if (!paraInt(c[4], periodo))
-        erros.push_back(prefixo(numLinha) + "periodo '" + c[4] + "' inválido (inteiro).");
 
     // prazo vazio: usa o próprio período (prazo implícito).
     if (c[5].empty())
@@ -222,30 +252,12 @@ void LeitorConfig::lerTarefa(const std::string& linha, int numLinha)
 
     if (erros.size() != errosAntes) return;   // não adianta validar o resto
 
-    // --- regras do Projeto A sobre o período ---
-    if (periodo < 0)
-    {
-        erros.push_back(prefixo(numLinha) + "periodo negativo é erro no arquivo.");
-        return;
-    }
-    if (periodo == 0)
-    {
-        // Tarefas aperiódicas só existem no Projeto B: ignora e avisa.
-        avisos.push_back(prefixo(numLinha) + "tarefa " + std::to_string(id) +
-                         " é aperiódica (periodo 0) e foi ignorada.");
-        return;
-    }
-    if (prazo < 1)
-    {
-        erros.push_back(prefixo(numLinha) + "prazo inválido.");
-        return;
-    }
     if (duracao > prazo)
         avisos.push_back(prefixo(numLinha) + "tarefa " + std::to_string(id) +
                          ": duracao maior que o prazo, vai perder o deadline.");
 
     idsLidos.insert(id);
-    tarefas.emplace_back(id, periodo, ingresso, duracao, prazo, static_cast<int>(cor));
+    tarefas.emplace_back(id, periodo, ingresso, duracao, prazo, cor);
 }
 
 // ---------------------------------------------------------------------------

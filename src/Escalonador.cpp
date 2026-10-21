@@ -8,6 +8,8 @@
 Escalonador::Escalonador(unsigned int semente) : gerador(semente) {}
 Escalonador::~Escalonador() = default;
 
+void Escalonador::semear(unsigned int semente) { gerador.seed(semente); }
+
 int Escalonador::comparar(const TCB& a, const TCB& b) const
 {
     // Critério do algoritmo (RM: período, EDF: prazo absoluto).

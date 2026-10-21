@@ -1,0 +1,8 @@
+# Pastas de build (CLion/CMake)
+cmake-build-*/
+build/
+
+# IDEs
+.idea/*
+!.idea/.gitignore
+.vscode/

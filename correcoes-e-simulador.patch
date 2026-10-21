@@ -1,0 +1,1484 @@
+diff --git a/.gitignore b/.gitignore
+new file mode 100644
+index 0000000..30a36cc
+--- /dev/null
++++ b/.gitignore
+@@ -0,0 +1,8 @@
++# Pastas de build (CLion/CMake)
++cmake-build-*/
++build/
++
++# IDEs
++.idea/*
++!.idea/.gitignore
++.vscode/
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index d966cb0..57b5cfd 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -1,26 +1,31 @@
+-cmake_minimum_required(VERSION 4.0)
+-project(ProjetoSO)
++# 3.20 basta para este projeto; exigir 4.0 impedia quem tem um CMake mais
++# antigo (o do Ubuntu 24.04 é o 3.28) de sequer configurar o build.
++cmake_minimum_required(VERSION 3.20)
++project(ProjetoSO CXX)
+ 
+ set(CMAKE_CXX_STANDARD 20)
++set(CMAKE_CXX_STANDARD_REQUIRED ON)
+ 
+ include_directories(headers)
+ 
+-add_executable(ProjetoSO src/main.cpp
++# Todo o código do simulador (menos o main) fica numa biblioteca estática
++# interna, para o executável e os testes usarem exatamente o mesmo código.
++add_library(nucleo STATIC
+         src/RelogioGlobal.cpp
+-        headers/RelogioGlobal.h
+-        headers/EstadoTarefa.h
+         src/Tarefa.cpp
+-        headers/Tarefa.h
++        src/TCB.cpp
+         src/Configuracao.cpp
+-        headers/Configuracao.h
+         src/LeitorConfig.cpp
+-        headers/LeitorConfig.h
+-        headers/TCB.h
++        src/Escalonador.cpp
+         src/EscalonadorRM.cpp
+-        headers/EscalonadorRM.h
+-        headers/EscalonadorEDF.h
+         src/EscalonadorEDF.cpp
+-        headers/Escalonador.h
+-        src/Escalonador.cpp
+-        src/TCB.cpp
+-        src/teste_escalonador.cpp)
++        src/Simulador.cpp)
++
++add_executable(ProjetoSO src/main.cpp)
++target_link_libraries(ProjetoSO PRIVATE nucleo)
++
++# Testes automatizados: "ctest" ou ./teste_simulador
++enable_testing()
++add_executable(teste_simulador testes/teste_simulador.cpp)
++target_link_libraries(teste_simulador PRIVATE nucleo)
++add_test(NAME simulador COMMAND teste_simulador)
+diff --git a/exemplos/com_aperiodica.txt b/exemplos/com_aperiodica.txt
+new file mode 100644
+index 0000000..74c8386
+--- /dev/null
++++ b/exemplos/com_aperiodica.txt
+@@ -0,0 +1,5 @@
++rm;2;2;
++1;FF0000;0;2;5;5;
++
++2 ; 00ff00 ; 1 ; 3 ; 10 ; 8
++3;0000FF;0;1;0;0
+diff --git a/exemplos/com_erros.txt b/exemplos/com_erros.txt
+new file mode 100644
+index 0000000..ba00fe0
+--- /dev/null
++++ b/exemplos/com_erros.txt
+@@ -0,0 +1,6 @@
++XYZ;0;0
++1;FF0000;0;2;5;5
++1;00FF00;0;3;4;4
++3;GGGGGG;0;1;5;5
++4;FF00FF;0;1;-3;5
++5;FF00FF;0;1;5
+diff --git a/exemplos/edf_cumpre_prazo.txt b/exemplos/edf_cumpre_prazo.txt
+new file mode 100644
+index 0000000..6973f40
+--- /dev/null
++++ b/exemplos/edf_cumpre_prazo.txt
+@@ -0,0 +1,3 @@
++EDF;1;1
++1;FF0000;0;2;5;5
++2;0000FF;0;4;7;7
+diff --git a/exemplos/multi_cpu.txt b/exemplos/multi_cpu.txt
+new file mode 100644
+index 0000000..8a7ff8a
+--- /dev/null
++++ b/exemplos/multi_cpu.txt
+@@ -0,0 +1,5 @@
++EDF;1;3
++1;FF0000;0;2;10;10
++2;00FF00;0;2;10;10
++3;0000FF;0;2;10;10
++4;FFFF00;3;1;8;8
+diff --git a/exemplos/rm_perde_prazo.txt b/exemplos/rm_perde_prazo.txt
+new file mode 100644
+index 0000000..b8690e7
+--- /dev/null
++++ b/exemplos/rm_perde_prazo.txt
+@@ -0,0 +1,3 @@
++RM;1;1
++1;FF0000;0;2;5;5
++2;0000FF;0;4;7;7
+diff --git a/headers/Escalonador.h b/headers/Escalonador.h
+index d73f355..64393f4 100644
+--- a/headers/Escalonador.h
++++ b/headers/Escalonador.h
+@@ -38,6 +38,11 @@ class Escalonador
+         // 'candidatas' deve conter as tarefas PRONTA e EXECUTANDO (fila global).
+         ResultadoEscalonamento escolher(const std::vector<TCB*>& candidatas, int numCpus);
+ 
++        // Reinicia o gerador do sorteio. O Simulador chama isto a cada tick com
++        // (semente + tick), então o sorteio daquele tick é sempre o mesmo: ao
++        // retroceder e avançar de novo o gantt não muda (requisito 1.5.2).
++        void semear(unsigned int semente);
++
+         // Menor valor = mais prioritária.
+         [[nodiscard]] virtual int prioridade(const TCB& tcb) const = 0;
+         [[nodiscard]] virtual std::string nome() const = 0;
+diff --git a/headers/EstadoTarefa.h b/headers/EstadoTarefa.h
+index c03342f..eae7baa 100644
+--- a/headers/EstadoTarefa.h
++++ b/headers/EstadoTarefa.h
+@@ -4,11 +4,21 @@
+ 
+ #ifndef PROJETOSO_ESTADOTAREFA_H
+ #define PROJETOSO_ESTADOTAREFA_H
++
++// Estados possíveis de uma tarefa.
++//
++// Por que existe "inativa"? No PDF (item 2.1), "suspensa" significa tarefa
++// bloqueada (p.ex. esperando um mutex) e é desenhada em preto/pontilhado no
++// gráfico de gantt. Uma tarefa periódica que ainda não chegou, ou que já
++// terminou a ativação atual e espera a próxima, NÃO está suspensa: ela
++// simplesmente não tem nada para executar. Usar "suspensa" para isso faria o
++// gantt mostrar bloqueios que não existem.
+ enum class EstadoTarefa
+ {
+-        pronta,
+-        executando,
+-        suspensa,
+-        terminada
++        inativa,     // sem ativação em andamento (ainda não chegou / esperando o próximo período)
++        pronta,      // ativada, na fila de prontos, esperando uma CPU
++        executando,  // ocupando uma CPU neste instante
++        suspensa,    // bloqueada (reservado ao Projeto B: mutex, E/S...)
++        terminada    // já executou todas as ativações previstas (10 no projeto A)
+ };
+-#endif //PROJETOSO_ESTADOTAREFA_H
+\ No newline at end of file
++#endif //PROJETOSO_ESTADOTAREFA_H
+diff --git a/headers/Simulador.h b/headers/Simulador.h
+new file mode 100644
+index 0000000..5167104
+--- /dev/null
++++ b/headers/Simulador.h
+@@ -0,0 +1,147 @@
++#ifndef PROJETOSO_SIMULADOR_H
++#define PROJETOSO_SIMULADOR_H
++
++#include <memory>
++#include <random>
++#include <string>
++#include <vector>
++
++#include "Configuracao.h"
++#include "Escalonador.h"
++#include "Tarefa.h"
++#include "TCB.h"
++
++// Tipos de evento que o gantt precisa desenhar, cada um com um elemento
++// gráfico próprio (requisito 3 dos requisitos gerais e 2.2 do Projeto A).
++enum class TipoEvento
++{
++    chegada,        // uma ativação da tarefa chegou ao sistema
++    termino,        // uma ativação terminou de executar
++    perdaPrazo,     // a ativação estourou o prazo (deadline)
++    preempcao,      // a tarefa perdeu a CPU sem ter terminado
++    sorteio,        // a tarefa começou a executar escolhida por SORTEIO (critério 5 do 4.3)
++    cpuLigada,      // a CPU voltou a ter tarefa para executar
++    cpuDesligada    // a CPU ficou sem tarefa e foi desligada (requisito 1.2)
++};
++
++[[nodiscard]] std::string nomeEvento(TipoEvento tipo);
++
++struct Evento
++{
++    int instante;       // instante EXATO em que o evento acontece
++    TipoEvento tipo;
++    int idTarefa;       // -1 nos eventos que são só da CPU
++    int cpu;            // -1 quando o evento não tem CPU associada
++};
++
++// "Foto" completa do sistema em um instante. Guardamos uma por tick para
++// poder avançar e retroceder (requisito 1.5.2). Só tem valores (sem ponteiros),
++// então copiar a struct copia tudo.
++struct EstadoSistema
++{
++    int tick = 0;
++    std::vector<TCB> tcbs;
++    std::vector<bool> cpuLigada;
++    // Quantos eventos já tinham acontecido neste instante. O log de eventos é
++    // um vetor único; este número diz qual pedaço dele "já aconteceu" quando
++    // estamos olhando para este tick (usado para retroceder e para descartar
++    // o futuro depois de uma edição).
++    std::size_t numEventos = 0;
++};
++
++// Resultado de uma tentativa de edição manual (requisitos 3.1 e 3.4): se não
++// for possível, 'mensagem' explica o motivo; se der certo, pode trazer uma
++// observação sobre quando a mudança passa a valer.
++struct ResultadoEdicao
++{
++    bool ok;
++    std::string mensagem;
++};
++
++// Simula um sistema multitarefa preemptivo de tempo compartilhado com várias
++// CPUs e uma fila de prontos GLOBAL. O tempo passa em ticks de relógio, sem
++// relação com o tempo real (requisito 1.1).
++//
++// Ordem das ações dentro de cada tick t (calcularPasso):
++//   1. chegam as ativações cujo instante é t;
++//   2. detecta quem estourou o prazo em t;
++//   3. o escalonador escolhe quem ocupa as CPUs;
++//   4. as tarefas são colocadas nas CPUs (CPU sem tarefa é desligada);
++//   5. as tarefas executam 1 tick; o resultado vale a partir de t+1.
++// Uma ativação que termina no instante t+1 com prazo t+1 CUMPRE o prazo.
++class Simulador
++{
++    public:
++        // Teto de segurança para o relógio: evita laço quase infinito quando o
++        // arquivo tem períodos gigantescos (guardamos uma foto por tick).
++        static constexpr int LIMITE_TICKS = 5000000;
++
++    private:
++        Configuracao config;
++        std::unique_ptr<Escalonador> escalonador;
++        unsigned int semente;
++
++        // historico[i] = estado do sistema no instante i. 'cursor' é o instante
++        // que está sendo mostrado; fica atrás do final quando o usuário retrocede.
++        std::vector<EstadoSistema> historico;
++        std::size_t cursor = 0;
++
++        // traco[t][cpu] = id da tarefa que executou na CPU durante o tick
++        // [t, t+1), ou -1 se a CPU estava desligada. É o que o gantt desenha.
++        std::vector<std::vector<int>> tracoExec;
++        std::vector<Evento> logEventos;
++        bool estourouLimite = false;
++
++        void calcularPasso();
++        // Joga fora tudo o que vem depois do cursor (após retroceder e editar,
++        // o futuro antigo não vale mais).
++        void descartarFuturo();
++        TCB* buscar(int id);
++
++    public:
++        // Lança std::invalid_argument se o algoritmo não existir.
++        // 'semente' controla os sorteios de desempate; com a mesma semente a
++        // simulação é sempre idêntica.
++        Simulador(const Configuracao& configuracao, const std::vector<Tarefa>& tarefas,
++                  unsigned int semente = std::random_device{}());
++        ~Simulador();
++
++        // ---- controle da execução ----
++        // Avança 1 tick (calculando, ou apenas reexibindo se já foi calculado).
++        // Retorna false se não há mais o que avançar (todas terminaram ou
++        // estourou o LIMITE_TICKS).
++        bool passo();
++        // Volta 1 tick no histórico. Retorna false se já está no instante 0.
++        bool voltar();
++        // Execução completa, sem intervenção (requisito 1.5.b). Retorna true
++        // se todas as tarefas terminaram.
++        bool executarCompleto();
++
++        // ---- consulta (para o depurador e o gantt) ----
++        [[nodiscard]] bool terminou() const;
++        [[nodiscard]] bool limiteExcedido() const;
++        [[nodiscard]] int tickAtual() const;
++        [[nodiscard]] const EstadoSistema& estadoAtual() const;
++        [[nodiscard]] const Configuracao& configuracao() const;
++        [[nodiscard]] unsigned int getSemente() const;
++        // Todos os eventos já calculados e, destes, quantos "já aconteceram"
++        // no tick atual (os primeiros numEventosVisiveis()).
++        [[nodiscard]] const std::vector<Evento>& eventos() const;
++        [[nodiscard]] std::size_t numEventosVisiveis() const;
++        // Quem executou em cada CPU em cada tick; só as primeiras tickAtual()
++        // linhas "já aconteceram".
++        [[nodiscard]] const std::vector<std::vector<int>>& traco() const;
++        // Total de ticks (até o tick atual) em que a CPU ficou desligada.
++        [[nodiscard]] int ticksDesligada(int cpu) const;
++
++        // ---- edição manual em qualquer passo (requisitos 1.5.2, 3.1 e 3.4) ----
++        // Toda edição aplicada com sucesso descarta o "futuro" já calculado,
++        // pois ele deixou de valer.
++        // Campos: tempo_restante, duracao, periodo, prazo, ingresso.
++        ResultadoEdicao editarTarefa(int id, const std::string& campo, int valor);
++        ResultadoEdicao encerrarTarefa(int id);
++        ResultadoEdicao alterarAlgoritmo(const std::string& nome);
++        ResultadoEdicao alterarNumCpus(int numCpus);
++};
++
++#endif //PROJETOSO_SIMULADOR_H
+diff --git a/headers/TCB.h b/headers/TCB.h
+index 24c9b70..ec73f76 100644
+--- a/headers/TCB.h
++++ b/headers/TCB.h
+@@ -1,6 +1,8 @@
+ #ifndef PROJETOSO_TCB_H
+ #define PROJETOSO_TCB_H
+ 
++#include <deque>
++
+ #include "EstadoTarefa.h"
+ #include "Tarefa.h"
+ 
+@@ -8,8 +10,16 @@
+ // tarefa (requisito 1.3): a Tarefa lida do arquivo + o seu estado atual.
+ // Como a tarefa é periódica, cada ativação é uma "execução" (job) nova, com
+ // prazo e tempo restante próprios.
++//
++// O TCB só tem valores (nada de ponteiros), então copiá-lo copia o estado
++// completo. É isso que permite guardar uma cópia do sistema a cada tick e
++// assim avançar/retroceder a simulação (requisito 1.5.2).
+ class TCB
+ {
++    public:
++        // O PDF (4.4) manda terminar a tarefa periódica após 10 execuções.
++        static constexpr int ATIVACOES_MAXIMAS = 10;
++
+     private:
+         Tarefa tarefa;
+         EstadoTarefa estado;
+@@ -20,6 +30,19 @@ class TCB
+         int cpu;                // CPU onde está executando; -1 se não está executando
+         int tempoNoQuantum;     // ticks seguidos executados sem parar (para o quantum)
+ 
++        // --- controle das ativações periódicas ---
++        int ativacoesLiberadas;       // quantas ativações já chegaram (0..ATIVACOES_MAXIMAS)
++        int ultimaLiberacao;          // instante da última ativação que chegou (-1 se nenhuma)
++        int instanteProximaLiberacao; // instante em que a próxima ativação chega
++        bool perdeuPrazo;             // a ativação ATUAL já estourou o prazo?
++
++        // Ativações que chegaram enquanto a anterior ainda não tinha terminado
++        // (acontece quando duracao > periodo ou o sistema está sobrecarregado).
++        // Guardamos o instante de chegada de cada uma; elas entram em execução
++        // na ordem, assim que a anterior terminar. Decisão: nenhuma ativação é
++        // descartada, para que a tarefa execute de fato as 10 vezes do enunciado.
++        std::deque<int> pendentes;
++
+     public:
+         explicit TCB(const Tarefa& tarefa);
+         ~TCB();
+@@ -27,7 +50,24 @@ class TCB
+         // Começa uma nova ativação da tarefa no instante indicado.
+         void novaAtivacao(int instante);
+ 
++        // A próxima ativação já deve chegar neste instante (ou antes)?
++        [[nodiscard]] bool temLiberacaoEm(int instante) const;
++
++        // Faz chegar a próxima ativação: ela vira a ativação atual se a tarefa
++        // estiver inativa, ou entra na fila de pendentes se a anterior não terminou.
++        // Retorna o instante nominal de chegada.
++        int liberarAtivacao();
++
++        // Chamado quando o tempo restante chegou a zero: conta a execução e
++        // passa para a próxima ativação pendente, ou para inativa/terminada.
++        void concluirAtivacao();
++
++        // Encerra a tarefa à força (usado na edição manual durante a simulação).
++        void encerrar();
++
+         [[nodiscard]] const Tarefa& getTarefa() const;
++        // Acesso para a edição manual de parâmetros (requisito 3.4).
++        [[nodiscard]] Tarefa& tarefaMutavel();
+         [[nodiscard]] EstadoTarefa getEstado() const;
+         [[nodiscard]] int getTempoRestante() const;
+         [[nodiscard]] int getInstanteAtivacao() const;
+@@ -35,12 +75,19 @@ class TCB
+         [[nodiscard]] int getExecucoes() const;
+         [[nodiscard]] int getCpu() const;
+         [[nodiscard]] int getTempoNoQuantum() const;
++        [[nodiscard]] int getAtivacoesLiberadas() const;
++        [[nodiscard]] int getUltimaLiberacao() const;
++        [[nodiscard]] int getInstanteProximaLiberacao() const;
++        [[nodiscard]] bool getPerdeuPrazo() const;
++        [[nodiscard]] std::size_t getNumPendentes() const;
+ 
+         void setEstado(EstadoTarefa estado);
+         void setTempoRestante(int tempoRestante);
+         void setExecucoes(int execucoes);
+         void setCpu(int cpu);
+         void setTempoNoQuantum(int tempoNoQuantum);
++        void setPerdeuPrazo(bool perdeu);
++        void setInstanteProximaLiberacao(int instante);
+ };
+ 
+ #endif //PROJETOSO_TCB_H
+diff --git a/headers/Tarefa.h b/headers/Tarefa.h
+index 5568947..0fab30b 100644
+--- a/headers/Tarefa.h
++++ b/headers/Tarefa.h
+@@ -5,18 +5,23 @@
+ #ifndef PROJETOSO_TAREFA_H
+ #define PROJETOSO_TAREFA_H
+ 
+-
++// Parâmetros ESTÁTICOS de uma tarefa, exatamente como vieram do arquivo de
++// configuração. O estado que muda durante a simulação (tempo restante,
++// prazo absoluto, CPU...) fica no TCB, não aqui.
++//
++// Os membros têm valor inicial para que o construtor padrão nunca deixe lixo
++// de memória (antes, Tarefa() = default deixava os campos sem inicializar).
+ class Tarefa
+ {
+      private:
+-        int id;
+-        int periodo;
+-        int ingresso;
+-        int duracao;
+-        int prazo;
+-        unsigned int cor;
++        int id = 0;
++        int periodo = 0;
++        int ingresso = 0;
++        int duracao = 0;
++        int prazo = 0;
++        unsigned int cor = 0;   // 0xRRGGBB
+     public:
+-        Tarefa(int id, int periodo, int ingresso, int duracao, int prazo, int cor);
++        Tarefa(int id, int periodo, int ingresso, int duracao, int prazo, unsigned int cor);
+         Tarefa();
+         ~Tarefa();
+ 
+@@ -36,4 +41,4 @@ class Tarefa
+ };
+ 
+ 
+-#endif //PROJETOSO_TAREFA_H
+\ No newline at end of file
++#endif //PROJETOSO_TAREFA_H
+diff --git a/src/Escalonador.cpp b/src/Escalonador.cpp
+index eb54380..c223f1a 100644
+--- a/src/Escalonador.cpp
++++ b/src/Escalonador.cpp
+@@ -8,6 +8,8 @@
+ Escalonador::Escalonador(unsigned int semente) : gerador(semente) {}
+ Escalonador::~Escalonador() = default;
+ 
++void Escalonador::semear(unsigned int semente) { gerador.seed(semente); }
++
+ int Escalonador::comparar(const TCB& a, const TCB& b) const
+ {
+     // Critério do algoritmo (RM: período, EDF: prazo absoluto).
+diff --git a/src/LeitorConfig.cpp b/src/LeitorConfig.cpp
+index f90b0c0..80f3814 100644
+--- a/src/LeitorConfig.cpp
++++ b/src/LeitorConfig.cpp
+@@ -195,10 +195,42 @@ void LeitorConfig::lerTarefa(const std::string& linha, int numLinha)
+     unsigned int cor = 0;
+ 
+     // --- id (inteiro, único) ---
++    // Vale para qualquer tarefa, inclusive as que serão ignoradas abaixo:
++    // os ids do arquivo precisam ser únicos de qualquer jeito.
++    bool idOk = true;
+     if (!paraInt(c[0], id) || id < 0)
++    {
+         erros.push_back(prefixo(numLinha) + "id '" + c[0] + "' inválido (inteiro >= 0).");
++        idOk = false;
++    }
+     else if (idsLidos.count(id))
++    {
+         erros.push_back(prefixo(numLinha) + "id " + std::to_string(id) + " repetido.");
++        idOk = false;
++    }
++
++    // --- periodo é lido ANTES dos outros campos ---
++    // Uma tarefa aperiódica (periodo 0) só existe no Projeto B. No Projeto A
++    // ela deve ser IGNORADA com um aviso (requisito 4.4), então o resto da
++    // linha (prazo, duração...) não pode gerar erro: antes, "3;0000FF;0;1;0;0"
++    // era rejeitado porque o prazo 0 era validado antes desta checagem.
++    const bool periodoOk = paraInt(c[4], periodo);
++    if (periodoOk && periodo == 0)
++    {
++        if (idOk)
++        {
++            idsLidos.insert(id);   // o id continua "ocupado", mesmo ignorada
++            avisos.push_back(prefixo(numLinha) + "tarefa " + std::to_string(id) +
++                             " é aperiódica (periodo 0) e foi ignorada (só é tratada no Projeto B).");
++        }
++        return;
++    }
++
++    if (!periodoOk)
++        erros.push_back(prefixo(numLinha) + "periodo '" + c[4] + "' inválido (inteiro).");
++    else if (periodo < 0)
++        erros.push_back(prefixo(numLinha) + "periodo negativo é erro no arquivo (periodo = " +
++                        c[4] + ").");
+ 
+     // --- cor (RRGGBB em hexadecimal) ---
+     if (!corValida(c[1]))
+@@ -206,13 +238,11 @@ void LeitorConfig::lerTarefa(const std::string& linha, int numLinha)
+     else
+         std::from_chars(c[1].data(), c[1].data() + 6, cor, 16);
+ 
+-    // --- campos numéricos ---
++    // --- demais campos numéricos ---
+     if (!paraInt(c[2], ingresso) || ingresso < 0)
+         erros.push_back(prefixo(numLinha) + "ingresso '" + c[2] + "' inválido (inteiro >= 0).");
+     if (!paraInt(c[3], duracao) || duracao < 1)
+         erros.push_back(prefixo(numLinha) + "duracao '" + c[3] + "' inválida (inteiro >= 1).");
+-    if (!paraInt(c[4], periodo))
+-        erros.push_back(prefixo(numLinha) + "periodo '" + c[4] + "' inválido (inteiro).");
+ 
+     // prazo vazio: usa o próprio período (prazo implícito).
+     if (c[5].empty())
+@@ -222,30 +252,12 @@ void LeitorConfig::lerTarefa(const std::string& linha, int numLinha)
+ 
+     if (erros.size() != errosAntes) return;   // não adianta validar o resto
+ 
+-    // --- regras do Projeto A sobre o período ---
+-    if (periodo < 0)
+-    {
+-        erros.push_back(prefixo(numLinha) + "periodo negativo é erro no arquivo.");
+-        return;
+-    }
+-    if (periodo == 0)
+-    {
+-        // Tarefas aperiódicas só existem no Projeto B: ignora e avisa.
+-        avisos.push_back(prefixo(numLinha) + "tarefa " + std::to_string(id) +
+-                         " é aperiódica (periodo 0) e foi ignorada.");
+-        return;
+-    }
+-    if (prazo < 1)
+-    {
+-        erros.push_back(prefixo(numLinha) + "prazo inválido.");
+-        return;
+-    }
+     if (duracao > prazo)
+         avisos.push_back(prefixo(numLinha) + "tarefa " + std::to_string(id) +
+                          ": duracao maior que o prazo, vai perder o deadline.");
+ 
+     idsLidos.insert(id);
+-    tarefas.emplace_back(id, periodo, ingresso, duracao, prazo, static_cast<int>(cor));
++    tarefas.emplace_back(id, periodo, ingresso, duracao, prazo, cor);
+ }
+ 
+ // ---------------------------------------------------------------------------
+diff --git a/src/Simulador.cpp b/src/Simulador.cpp
+new file mode 100644
+index 0000000..d490fa6
+--- /dev/null
++++ b/src/Simulador.cpp
+@@ -0,0 +1,398 @@
++#include "../headers/Simulador.h"
++
++#include <algorithm>
++#include <cctype>
++#include <set>
++#include <stdexcept>
++
++namespace
++{
++    std::string minusculas(std::string s)
++    {
++        for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
++        return s;
++    }
++
++    ResultadoEdicao erro(const std::string& mensagem) { return {false, mensagem}; }
++    ResultadoEdicao sucesso(const std::string& mensagem = "") { return {true, mensagem}; }
++
++    bool estaAtiva(const TCB& t)
++    {
++        return t.getEstado() == EstadoTarefa::pronta || t.getEstado() == EstadoTarefa::executando;
++    }
++
++    const char* nomeEstado(EstadoTarefa e)
++    {
++        switch (e)
++        {
++            case EstadoTarefa::inativa: return "inativa";
++            case EstadoTarefa::pronta: return "pronta";
++            case EstadoTarefa::executando: return "executando";
++            case EstadoTarefa::suspensa: return "suspensa";
++            case EstadoTarefa::terminada: return "terminada";
++        }
++        return "?";
++    }
++}
++
++std::string nomeEvento(TipoEvento tipo)
++{
++    switch (tipo)
++    {
++        case TipoEvento::chegada: return "chegada";
++        case TipoEvento::termino: return "termino";
++        case TipoEvento::perdaPrazo: return "perda de prazo";
++        case TipoEvento::preempcao: return "preempcao";
++        case TipoEvento::sorteio: return "sorteio";
++        case TipoEvento::cpuLigada: return "CPU ligada";
++        case TipoEvento::cpuDesligada: return "CPU desligada";
++    }
++    return "?";
++}
++
++// ---------------------------------------------------------------------------
++Simulador::Simulador(const Configuracao& configuracao, const std::vector<Tarefa>& tarefas,
++                     unsigned int semente)
++    : config(configuracao), semente(semente)
++{
++    escalonador = criarEscalonador(config.getAlgoritmo());
++    if (!escalonador)
++        throw std::invalid_argument("Algoritmo de escalonamento desconhecido: '" +
++                                    config.getAlgoritmo() + "' (use RM ou EDF).");
++    if (config.getNumCpus() < 1)
++        throw std::invalid_argument("A quantidade de CPUs deve ser pelo menos 1.");
++
++    // Instante 0: ninguém chegou ainda, todas as CPUs começam ligadas (as que
++    // não tiverem o que fazer são desligadas e isso aparece como evento).
++    EstadoSistema inicial;
++    inicial.tick = 0;
++    for (const Tarefa& t : tarefas) inicial.tcbs.emplace_back(t);
++    inicial.cpuLigada.assign(static_cast<std::size_t>(config.getNumCpus()), true);
++    inicial.numEventos = 0;
++    historico.push_back(std::move(inicial));
++}
++
++Simulador::~Simulador() = default;
++
++// ---------------------------------------------------------------------------
++void Simulador::calcularPasso()
++{
++    EstadoSistema novo = historico[cursor];      // parte de uma cópia do estado atual
++    const int t = novo.tick;
++    const int numCpus = config.getNumCpus();
++
++    // 1) Chegada das ativações no instante t.
++    for (TCB& tcb : novo.tcbs)
++    {
++        if (!tcb.temLiberacaoEm(t)) continue;
++        tcb.liberarAtivacao();
++        logEventos.push_back({t, TipoEvento::chegada, tcb.getTarefa().getId(), -1});
++    }
++
++    // 2) Perda de prazo: a ativação atual ainda não terminou e o instante do
++    //    prazo absoluto chegou. A tarefa continua executando (PDF, campo
++    //    'prazo'); só marcamos e registramos o evento UMA vez por ativação.
++    //    O evento é gravado no instante exato do prazo, mesmo que só o
++    //    percebamos depois (ativação que esperou na fila de pendentes).
++    for (TCB& tcb : novo.tcbs)
++    {
++        if (estaAtiva(tcb) && !tcb.getPerdeuPrazo() && t >= tcb.getPrazoAbsoluto())
++        {
++            tcb.setPerdeuPrazo(true);
++            logEventos.push_back({tcb.getPrazoAbsoluto(), TipoEvento::perdaPrazo,
++                                  tcb.getTarefa().getId(), tcb.getCpu()});
++        }
++    }
++
++    // 3) O escalonador escolhe, entre prontas e executando (fila global), as
++    //    tarefas que devem ocupar as CPUs neste tick.
++    std::vector<TCB*> candidatas;
++    for (TCB& tcb : novo.tcbs)
++        if (estaAtiva(tcb)) candidatas.push_back(&tcb);
++
++    // Semente = base + tick: o sorteio deste tick é sempre o mesmo, mesmo que
++    // o usuário volte no tempo e avance de novo.
++    escalonador->semear(semente + static_cast<unsigned int>(t));
++    ResultadoEscalonamento res = escalonador->escolher(candidatas, numCpus);
++
++    std::set<const TCB*> escolhidas(res.escolhidas.begin(), res.escolhidas.end());
++    std::set<int> sorteadas(res.sorteadas.begin(), res.sorteadas.end());
++
++    // 4) Coloca as tarefas nas CPUs.
++    //    4a) Quem estava executando e não foi escolhida sofre preempção.
++    for (TCB& tcb : novo.tcbs)
++    {
++        if (tcb.getEstado() == EstadoTarefa::executando && !escolhidas.count(&tcb))
++        {
++            logEventos.push_back({t, TipoEvento::preempcao, tcb.getTarefa().getId(), tcb.getCpu()});
++            tcb.setEstado(EstadoTarefa::pronta);
++            tcb.setCpu(-1);
++        }
++    }
++
++    //    4b) Quem foi escolhida e já executava continua na MESMA CPU (evita
++    //        migrações desnecessárias entre processadores).
++    std::vector<TCB*> naCpu(static_cast<std::size_t>(numCpus), nullptr);
++    for (TCB* p : res.escolhidas)
++        if (p->getEstado() == EstadoTarefa::executando)
++            naCpu[static_cast<std::size_t>(p->getCpu())] = p;
++
++    //    4c) As demais escolhidas ocupam a CPU livre de menor índice. Ordenamos
++    //        por id só para a atribuição ser previsível (id menor, CPU menor);
++    //        a escolha de QUEM executa já foi feita pelo escalonador.
++    std::vector<TCB*> novatas;
++    for (TCB* p : res.escolhidas)
++        if (p->getEstado() != EstadoTarefa::executando) novatas.push_back(p);
++    std::sort(novatas.begin(), novatas.end(), [](const TCB* a, const TCB* b) {
++        return a->getTarefa().getId() < b->getTarefa().getId();
++    });
++
++    for (TCB* p : novatas)
++    {
++        std::size_t c = 0;
++        while (naCpu[c] != nullptr) c++;   // sempre existe CPU livre: escolhidas <= numCpus
++        naCpu[c] = p;
++        p->setEstado(EstadoTarefa::executando);
++        p->setCpu(static_cast<int>(c));
++        p->setTempoNoQuantum(0);
++        // O gantt mostra o sorteio no momento em que a tarefa (re)começa a executar.
++        if (sorteadas.count(p->getTarefa().getId()))
++            logEventos.push_back({t, TipoEvento::sorteio, p->getTarefa().getId(), static_cast<int>(c)});
++    }
++
++    //    4d) CPU sem tarefa é desligada; ao voltar a ter tarefa, é ligada.
++    std::vector<int> linha(static_cast<std::size_t>(numCpus), -1);
++    for (std::size_t c = 0; c < naCpu.size(); c++)
++    {
++        if (naCpu[c] != nullptr)
++        {
++            linha[c] = naCpu[c]->getTarefa().getId();
++            if (!novo.cpuLigada[c])
++            {
++                novo.cpuLigada[c] = true;
++                logEventos.push_back({t, TipoEvento::cpuLigada, -1, static_cast<int>(c)});
++            }
++        }
++        else if (novo.cpuLigada[c])
++        {
++            novo.cpuLigada[c] = false;
++            logEventos.push_back({t, TipoEvento::cpuDesligada, -1, static_cast<int>(c)});
++        }
++    }
++    tracoExec.push_back(linha);
++
++    // 5) Executa 1 tick. Quem zerar o tempo restante termina em t+1.
++    for (TCB* p : naCpu)
++    {
++        if (p == nullptr) continue;
++        p->setTempoRestante(p->getTempoRestante() - 1);
++        p->setTempoNoQuantum(p->getTempoNoQuantum() + 1);
++        if (p->getTempoRestante() == 0)
++        {
++            logEventos.push_back({t + 1, TipoEvento::termino, p->getTarefa().getId(), p->getCpu()});
++            p->concluirAtivacao();   // libera a CPU e passa para a próxima ativação, se houver
++        }
++    }
++
++    novo.tick = t + 1;
++    novo.numEventos = logEventos.size();
++    historico.push_back(std::move(novo));
++    cursor = historico.size() - 1;
++}
++
++// ---------------------------------------------------------------------------
++bool Simulador::passo()
++{
++    // Já calculamos este futuro (o usuário tinha retrocedido): só reexibe.
++    if (cursor + 1 < historico.size())
++    {
++        cursor++;
++        return true;
++    }
++    if (terminou()) return false;
++    if (historico[cursor].tick >= LIMITE_TICKS)
++    {
++        estourouLimite = true;
++        return false;
++    }
++    calcularPasso();
++    return true;
++}
++
++bool Simulador::voltar()
++{
++    if (cursor == 0) return false;
++    cursor--;
++    return true;
++}
++
++bool Simulador::executarCompleto()
++{
++    while (passo()) {}
++    return terminou();
++}
++
++// ---------------------------------------------------------------------------
++bool Simulador::terminou() const
++{
++    for (const TCB& t : historico[cursor].tcbs)
++        if (t.getEstado() != EstadoTarefa::terminada) return false;
++    return true;
++}
++
++bool Simulador::limiteExcedido() const { return estourouLimite; }
++int Simulador::tickAtual() const { return historico[cursor].tick; }
++const EstadoSistema& Simulador::estadoAtual() const { return historico[cursor]; }
++const Configuracao& Simulador::configuracao() const { return config; }
++unsigned int Simulador::getSemente() const { return semente; }
++const std::vector<Evento>& Simulador::eventos() const { return logEventos; }
++std::size_t Simulador::numEventosVisiveis() const { return historico[cursor].numEventos; }
++const std::vector<std::vector<int>>& Simulador::traco() const { return tracoExec; }
++
++int Simulador::ticksDesligada(int cpu) const
++{
++    int total = 0;
++    for (std::size_t t = 0; t < cursor; t++)
++        if (tracoExec[t][static_cast<std::size_t>(cpu)] == -1) total++;
++    return total;
++}
++
++// ---------------------------------------------------------------------------
++void Simulador::descartarFuturo()
++{
++    historico.erase(historico.begin() + static_cast<std::ptrdiff_t>(cursor) + 1, historico.end());
++    tracoExec.erase(tracoExec.begin() + static_cast<std::ptrdiff_t>(cursor), tracoExec.end());
++    logEventos.erase(logEventos.begin() + static_cast<std::ptrdiff_t>(historico[cursor].numEventos),
++                     logEventos.end());
++    estourouLimite = false;
++}
++
++TCB* Simulador::buscar(int id)
++{
++    for (TCB& t : historico[cursor].tcbs)
++        if (t.getTarefa().getId() == id) return &t;
++    return nullptr;
++}
++
++// ---------------------------------------------------------------------------
++ResultadoEdicao Simulador::editarTarefa(int id, const std::string& campoOriginal, int valor)
++{
++    TCB* tcb = buscar(id);
++    if (tcb == nullptr)
++        return erro("A tarefa " + std::to_string(id) + " não existe.");
++    if (tcb->getEstado() == EstadoTarefa::terminada)
++        return erro("A tarefa " + std::to_string(id) + " já terminou; não há mais o que modificar.");
++
++    const std::string campo = minusculas(campoOriginal);
++    std::string nota;
++
++    if (campo == "tempo_restante")
++    {
++        // Só faz sentido para quem tem uma ativação em andamento.
++        if (!estaAtiva(*tcb))
++            return erro("A tarefa " + std::to_string(id) + " está " + nomeEstado(tcb->getEstado()) +
++                        ": não há ativação em andamento, então não existe tempo restante para alterar.");
++        const int duracao = tcb->getTarefa().getDuracao();
++        if (valor < 1 || valor > duracao)
++            return erro("tempo_restante deve estar entre 1 e a duração da tarefa (" +
++                        std::to_string(duracao) + "). Para encerrar a tarefa use 'encerrar'.");
++        tcb->setTempoRestante(valor);
++    }
++    else if (campo == "duracao")
++    {
++        if (valor < 1) return erro("duracao deve ser um inteiro >= 1.");
++        tcb->tarefaMutavel().setDuracao(valor);
++        nota = "A nova duração vale a partir da PRÓXIMA ativação; a ativação em andamento "
++               "mantém o tempo restante atual (altere-o com 'tempo_restante' se quiser).";
++    }
++    else if (campo == "prazo")
++    {
++        if (valor < 1) return erro("prazo deve ser um inteiro >= 1.");
++        tcb->tarefaMutavel().setPrazo(valor);
++        nota = "O novo prazo vale a partir da PRÓXIMA ativação; o prazo já calculado para a "
++               "ativação em andamento não muda.";
++    }
++    else if (campo == "periodo")
++    {
++        if (valor < 1)
++            return erro("periodo deve ser um inteiro >= 1 (periodo 0 ou negativo é de tarefa "
++                        "aperiódica/esporádica, tratada só no Projeto B).");
++        // Se já chegou alguma ativação, a próxima passa a ser "última + novo período".
++        if (tcb->getAtivacoesLiberadas() > 0 &&
++            tcb->getAtivacoesLiberadas() < TCB::ATIVACOES_MAXIMAS)
++        {
++            const int proxima = tcb->getUltimaLiberacao() + valor;
++            if (proxima < tickAtual())
++                return erro("Com periodo " + std::to_string(valor) + " a próxima ativação seria no "
++                            "instante " + std::to_string(proxima) + ", que já passou (instante atual: " +
++                            std::to_string(tickAtual()) + "). Escolha um período maior.");
++            tcb->setInstanteProximaLiberacao(proxima);
++        }
++        tcb->tarefaMutavel().setPeriodo(valor);
++        nota = "O novo período vale a partir da próxima ativação.";
++    }
++    else if (campo == "ingresso")
++    {
++        if (tcb->getAtivacoesLiberadas() > 0)
++            return erro("A tarefa " + std::to_string(id) + " já chegou ao sistema; o ingresso só pode "
++                        "ser alterado antes da primeira ativação.");
++        if (valor < tickAtual())
++            return erro("O ingresso não pode ser anterior ao instante atual (" +
++                        std::to_string(tickAtual()) + ").");
++        tcb->tarefaMutavel().setIngresso(valor);
++        tcb->setInstanteProximaLiberacao(valor);
++    }
++    else
++    {
++        return erro("Campo '" + campoOriginal + "' desconhecido. Campos editáveis: "
++                    "tempo_restante, duracao, periodo, prazo, ingresso.");
++    }
++
++    descartarFuturo();
++    return sucesso(nota);
++}
++
++ResultadoEdicao Simulador::encerrarTarefa(int id)
++{
++    TCB* tcb = buscar(id);
++    if (tcb == nullptr)
++        return erro("A tarefa " + std::to_string(id) + " não existe.");
++    if (tcb->getEstado() == EstadoTarefa::terminada)
++        return erro("A tarefa " + std::to_string(id) + " já está terminada.");
++
++    const int cpu = tcb->getCpu();
++    tcb->encerrar();
++    descartarFuturo();
++    // Registra o fim no instante atual. Se o futuro foi descartado, o log
++    // termina exatamente nos eventos já ocorridos, então basta acrescentar.
++    logEventos.push_back({tickAtual(), TipoEvento::termino, id, cpu});
++    historico[cursor].numEventos = logEventos.size();
++    return sucesso("A tarefa foi encerrada no instante " + std::to_string(tickAtual()) + ".");
++}
++
++ResultadoEdicao Simulador::alterarAlgoritmo(const std::string& nome)
++{
++    std::unique_ptr<Escalonador> novo = criarEscalonador(nome);
++    if (!novo)
++        return erro("Algoritmo '" + nome + "' desconhecido. Algoritmos disponíveis: RM, EDF.");
++    escalonador = std::move(novo);
++    config.setAlgoritmo(escalonador->nome());
++    descartarFuturo();
++    return sucesso("O novo algoritmo vale a partir do instante " + std::to_string(tickAtual()) +
++                   "; o que já foi simulado antes disso não é recalculado.");
++}
++
++ResultadoEdicao Simulador::alterarNumCpus(int numCpus)
++{
++    if (numCpus < 1)
++        return erro("A quantidade de CPUs deve ser pelo menos 1.");
++    // Mudar o número de CPUs no meio da simulação deixaria o gantt dos
++    // instantes anteriores inconsistente (CPUs que "apareceriam" do nada).
++    if (tickAtual() != 0)
++        return erro("A quantidade de CPUs só pode ser alterada no instante 0 (você está no instante " +
++                    std::to_string(tickAtual()) + "). Volte ao início da simulação para alterá-la.");
++    config.setNumCpus(numCpus);
++    descartarFuturo();
++    historico[cursor].cpuLigada.assign(static_cast<std::size_t>(numCpus), true);
++    return sucesso();
++}
+diff --git a/src/TCB.cpp b/src/TCB.cpp
+index c90b514..e2410c8 100644
+--- a/src/TCB.cpp
++++ b/src/TCB.cpp
+@@ -1,14 +1,18 @@
+ #include "../headers/TCB.h"
+-//bah gurizada
++
+ TCB::TCB(const Tarefa& tarefa)
+     : tarefa(tarefa),
+-      estado(EstadoTarefa::suspensa),
++      estado(EstadoTarefa::inativa),            // ainda não chegou: não é "suspensa"
+       tempoRestante(tarefa.getDuracao()),
+       instanteAtivacao(tarefa.getIngresso()),
+       prazoAbsoluto(tarefa.getIngresso() + tarefa.getPrazo()),
+       execucoes(0),
+       cpu(-1),
+-      tempoNoQuantum(0)
++      tempoNoQuantum(0),
++      ativacoesLiberadas(0),
++      ultimaLiberacao(-1),
++      instanteProximaLiberacao(tarefa.getIngresso()),   // 1ª ativação = instante de ingresso
++      perdeuPrazo(false)
+ {
+ }
+ 
+@@ -21,10 +25,67 @@ void TCB::novaAtivacao(int instante)
+     tempoRestante = tarefa.getDuracao();
+     tempoNoQuantum = 0;
+     cpu = -1;
++    perdeuPrazo = false;
+     estado = EstadoTarefa::pronta;
+ }
+ 
++bool TCB::temLiberacaoEm(int instante) const
++{
++    // ">=" e não "==": se uma edição manual atrasar o relógio em relação à
++    // liberação agendada, a ativação não fica "perdida" para sempre.
++    return ativacoesLiberadas < ATIVACOES_MAXIMAS && instante >= instanteProximaLiberacao;
++}
++
++int TCB::liberarAtivacao()
++{
++    const int chegada = instanteProximaLiberacao;
++    ativacoesLiberadas++;
++    ultimaLiberacao = chegada;
++    // A próxima chegada é sempre "última + período". Guardar o instante
++    // (em vez de recalcular ingresso + k*periodo) faz com que mudar o período
++    // durante a simulação valha só daqui para frente.
++    instanteProximaLiberacao = chegada + tarefa.getPeriodo();
++
++    if (estado == EstadoTarefa::inativa)
++        novaAtivacao(chegada);          // nada em andamento: começa já
++    else
++        pendentes.push_back(chegada);   // a anterior ainda não terminou: espera na fila
++    return chegada;
++}
++
++void TCB::concluirAtivacao()
++{
++    execucoes++;
++    cpu = -1;
++    tempoNoQuantum = 0;
++    tempoRestante = 0;
++
++    if (!pendentes.empty())
++    {
++        // Já havia outra ativação esperando: ela começa agora, mas o prazo dela
++        // conta a partir de quando CHEGOU (não de quando começou a executar).
++        const int chegada = pendentes.front();
++        pendentes.pop_front();
++        novaAtivacao(chegada);
++    }
++    else if (execucoes >= ATIVACOES_MAXIMAS)
++        estado = EstadoTarefa::terminada;   // executou as 10 vezes: fim da tarefa
++    else
++        estado = EstadoTarefa::inativa;     // espera a próxima ativação
++}
++
++void TCB::encerrar()
++{
++    estado = EstadoTarefa::terminada;
++    cpu = -1;
++    tempoRestante = 0;
++    tempoNoQuantum = 0;
++    pendentes.clear();
++    ativacoesLiberadas = ATIVACOES_MAXIMAS;   // nunca mais é ativada
++}
++
+ const Tarefa& TCB::getTarefa() const { return tarefa; }
++Tarefa& TCB::tarefaMutavel() { return tarefa; }
+ EstadoTarefa TCB::getEstado() const { return estado; }
+ int TCB::getTempoRestante() const { return tempoRestante; }
+ int TCB::getInstanteAtivacao() const { return instanteAtivacao; }
+@@ -32,9 +93,16 @@ int TCB::getPrazoAbsoluto() const { return prazoAbsoluto; }
+ int TCB::getExecucoes() const { return execucoes; }
+ int TCB::getCpu() const { return cpu; }
+ int TCB::getTempoNoQuantum() const { return tempoNoQuantum; }
++int TCB::getAtivacoesLiberadas() const { return ativacoesLiberadas; }
++int TCB::getUltimaLiberacao() const { return ultimaLiberacao; }
++int TCB::getInstanteProximaLiberacao() const { return instanteProximaLiberacao; }
++bool TCB::getPerdeuPrazo() const { return perdeuPrazo; }
++std::size_t TCB::getNumPendentes() const { return pendentes.size(); }
+ 
+ void TCB::setEstado(EstadoTarefa novoEstado) { estado = novoEstado; }
+ void TCB::setTempoRestante(int novoTempo) { tempoRestante = novoTempo; }
+ void TCB::setExecucoes(int novasExecucoes) { execucoes = novasExecucoes; }
+ void TCB::setCpu(int novaCpu) { cpu = novaCpu; }
+ void TCB::setTempoNoQuantum(int novoTempo) { tempoNoQuantum = novoTempo; }
++void TCB::setPerdeuPrazo(bool perdeu) { perdeuPrazo = perdeu; }
++void TCB::setInstanteProximaLiberacao(int instante) { instanteProximaLiberacao = instante; }
+diff --git a/src/Tarefa.cpp b/src/Tarefa.cpp
+index f6783b5..e3092ff 100644
+--- a/src/Tarefa.cpp
++++ b/src/Tarefa.cpp
+@@ -6,7 +6,7 @@
+ 
+ Tarefa::Tarefa() = default;
+ Tarefa::Tarefa(int id, int periodo, int ingresso,
+-                int duracao, int prazo, int cor)
++                int duracao, int prazo, unsigned int cor)
+     : id(id),
+     periodo(periodo),
+     ingresso(ingresso),
+diff --git a/src/main.cpp b/src/main.cpp
+index 27ff33c..a9dd34a 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -1,35 +1,110 @@
+-// Teste simples do LeitorConfig.
+-// Uso: ./teste_leitor arquivo.txt
++// Executa a simulação completa (modo b do requisito 1.5) e imprime um
++// relatório em texto. É uma ferramenta de verificação do núcleo do simulador:
++// o gráfico de gantt e a interface com o usuário serão feitos por cima dele.
++//
++// Uso: ProjetoSO arquivo_de_configuracao.txt [semente]
++#include <algorithm>
++#include <cstdlib>
++#include <exception>
+ #include <iomanip>
+ #include <iostream>
++#include <map>
+ 
+ #include "LeitorConfig.h"
++#include "Simulador.h"
++
++namespace
++{
++    // Mostra, para cada CPU, os intervalos [inicio,fim) em que executou cada
++    // tarefa ou ficou desligada.
++    void imprimirLinhaDoTempo(const Simulador& sim)
++    {
++        const auto& traco = sim.traco();
++        const int numCpus = sim.configuracao().getNumCpus();
++        for (int cpu = 0; cpu < numCpus; cpu++)
++        {
++            std::cout << "CPU " << cpu << ":";
++            std::size_t ini = 0;
++            while (ini < traco.size())
++            {
++                const int quem = traco[ini][static_cast<std::size_t>(cpu)];
++                std::size_t fim = ini;
++                while (fim < traco.size() && traco[fim][static_cast<std::size_t>(cpu)] == quem) fim++;
++                std::cout << " [" << ini << "," << fim << ")="
++                          << (quem == -1 ? std::string("desligada") : "T" + std::to_string(quem));
++                ini = fim;
++            }
++            std::cout << "  | desligada por " << sim.ticksDesligada(cpu) << " ticks\n";
++        }
++    }
++}
+ 
+ int main(int argc, char** argv)
+ {
+     if (argc < 2)
+     {
+-        std::cout << "Uso: " << argv[0] << " arquivo_de_configuracao.txt\n";
++        std::cout << "Uso: " << argv[0] << " arquivo_de_configuracao.txt [semente]\n";
+         return 1;
+     }
+ 
+     LeitorConfig leitor;
+-    bool ok = leitor.carregar(argv[1]);
++    const bool ok = leitor.carregar(argv[1]);
+ 
+-    Configuracao cfg = leitor.getConfiguracao();
+-    std::cout << "algoritmo=" << cfg.getAlgoritmo() << " quantum=" << cfg.getQuantum()
+-              << " cpus=" << cfg.getNumCpus() << "\n";
++    for (const std::string& a : leitor.getAvisos()) std::cout << "AVISO: " << a << "\n";
++    for (const std::string& e : leitor.getErros())  std::cout << "ERRO:  " << e << "\n";
++    if (!ok) return 1;
++
++    const Configuracao cfg = leitor.getConfiguracao();
+ 
+-    for (const Tarefa& t : leitor.getTarefas())
++    unsigned int semente = std::random_device{}();
++    if (argc >= 3) semente = static_cast<unsigned int>(std::strtoul(argv[2], nullptr, 10));
++
++    try
+     {
+-        std::cout << "id=" << t.getId() << " cor=#" << std::hex << std::uppercase
+-                  << std::setw(6) << std::setfill('0') << t.getCor() << std::dec << std::setfill(' ')
+-                  << " ingresso=" << t.getIngresso() << " duracao=" << t.getDuracao()
+-                  << " periodo=" << t.getPeriodo() << " prazo=" << t.getPrazo() << "\n";
+-    }
++        Simulador sim(cfg, leitor.getTarefas(), semente);
++        std::cout << "algoritmo=" << cfg.getAlgoritmo() << " quantum=" << cfg.getQuantum()
++                  << " cpus=" << cfg.getNumCpus() << " semente=" << semente << "\n\n";
+ 
+-    for (const std::string& a : leitor.getAvisos()) std::cout << "AVISO: " << a << "\n";
+-    for (const std::string& e : leitor.getErros())  std::cout << "ERRO:  " << e << "\n";
++        const bool terminou = sim.executarCompleto();
++        if (!terminou)
++        {
++            std::cout << "ERRO: a simulação passou do limite de " << Simulador::LIMITE_TICKS
++                      << " ticks sem terminar. Verifique períodos muito grandes no arquivo.\n";
++            return 1;
++        }
++
++        std::cout << "Simulação terminou no instante " << sim.tickAtual() << ".\n\n";
++
++        std::cout << "--- Eventos ---\n";
++        std::vector<Evento> evs = sim.eventos();
++        std::stable_sort(evs.begin(), evs.end(),
++                         [](const Evento& a, const Evento& b) { return a.instante < b.instante; });
++        for (const Evento& e : evs)
++        {
++            std::cout << "t=" << std::setw(4) << e.instante << "  " << nomeEvento(e.tipo);
++            if (e.idTarefa >= 0) std::cout << "  T" << e.idTarefa;
++            if (e.cpu >= 0) std::cout << "  (CPU " << e.cpu << ")";
++            std::cout << "\n";
++        }
++
++        std::cout << "\n--- Linha do tempo por CPU ---\n";
++        imprimirLinhaDoTempo(sim);
+ 
+-    return ok ? 0 : 1;
++        std::cout << "\n--- Resumo por tarefa ---\n";
++        std::map<int, int> perdas;
++        for (const Evento& e : sim.eventos())
++            if (e.tipo == TipoEvento::perdaPrazo) perdas[e.idTarefa]++;
++        for (const TCB& t : sim.estadoAtual().tcbs)
++        {
++            const int id = t.getTarefa().getId();
++            std::cout << "T" << id << ": execucoes=" << t.getExecucoes()
++                      << " prazos_perdidos=" << perdas[id] << "\n";
++        }
++    }
++    catch (const std::exception& ex)
++    {
++        std::cout << "ERRO: " << ex.what() << "\n";
++        return 1;
++    }
++    return 0;
+ }
+diff --git a/testes/teste_simulador.cpp b/testes/teste_simulador.cpp
+new file mode 100644
+index 0000000..649beb8
+--- /dev/null
++++ b/testes/teste_simulador.cpp
+@@ -0,0 +1,256 @@
++// Testes automatizados do núcleo do simulador (sem biblioteca externa).
++// Cada CHECK imprime a falha com o número da linha; o programa retorna 0 se
++// tudo passou e 1 caso contrário (assim o "ctest" enxerga o resultado).
++#include <filesystem>
++#include <fstream>
++#include <iostream>
++
++#include "LeitorConfig.h"
++#include "Simulador.h"
++
++namespace
++{
++    int falhas = 0;
++
++#define CHECK(cond)                                                              \
++    do {                                                                         \
++        if (!(cond)) {                                                           \
++            std::cout << "FALHOU (linha " << __LINE__ << "): " #cond "\n";       \
++            falhas++;                                                            \
++        }                                                                        \
++    } while (0)
++
++    Configuracao cfg(const std::string& algoritmo, int cpus, int quantum = 1)
++    {
++        return Configuracao(quantum, cpus, algoritmo);
++    }
++
++    // id, periodo, ingresso, duracao, prazo
++    Tarefa tarefa(int id, int periodo, int ingresso, int duracao, int prazo)
++    {
++        return Tarefa(id, periodo, ingresso, duracao, prazo, 0x808080);
++    }
++
++    int contar(const Simulador& s, TipoEvento tipo, int id = -2)
++    {
++        int n = 0;
++        for (const Evento& e : s.eventos())
++            if (e.tipo == tipo && (id == -2 || e.idTarefa == id)) n++;
++        return n;
++    }
++
++    int ticksExecutados(const Simulador& s, int id)
++    {
++        int n = 0;
++        for (const auto& linha : s.traco())
++            for (int quem : linha)
++                if (quem == id) n++;
++        return n;
++    }
++
++    std::string escreverArquivo(const std::string& nome, const std::string& texto)
++    {
++        const std::string caminho = (std::filesystem::temp_directory_path() / nome).string();
++        std::ofstream(caminho) << texto;
++        return caminho;
++    }
++
++    // RM falha e EDF não, no mesmo conjunto (U = 2/5 + 4/7 = 0,97 > limite do RM).
++    void testeRmContraEdf()
++    {
++        std::vector<Tarefa> ts = {tarefa(1, 5, 0, 2, 5), tarefa(2, 7, 0, 4, 7)};
++
++        Simulador rm(cfg("RM", 1), ts, 1);
++        CHECK(rm.executarCompleto());
++        CHECK(contar(rm, TipoEvento::perdaPrazo, 1) == 0);
++        CHECK(contar(rm, TipoEvento::perdaPrazo, 2) >= 1);   // T2 estoura o prazo no instante 7
++        // Perder o prazo não encerra a tarefa: ela executa as 10 vezes completas.
++        CHECK(ticksExecutados(rm, 1) == 10 * 2);
++        CHECK(ticksExecutados(rm, 2) == 10 * 4);
++        CHECK(contar(rm, TipoEvento::termino, 2) == 10);
++
++        Simulador edf(cfg("EDF", 1), ts, 1);
++        CHECK(edf.executarCompleto());
++        CHECK(contar(edf, TipoEvento::perdaPrazo) == 0);
++        CHECK(ticksExecutados(edf, 1) == 20);
++        CHECK(ticksExecutados(edf, 2) == 40);
++    }
++
++    // O instante exato da perda de prazo é o do prazo (T2: chega em 0, prazo 7).
++    void testeInstanteDaPerdaDePrazo()
++    {
++        Simulador rm(cfg("RM", 1), {tarefa(1, 5, 0, 2, 5), tarefa(2, 7, 0, 4, 7)}, 1);
++        rm.executarCompleto();
++        bool achou = false;
++        for (const Evento& e : rm.eventos())
++            if (e.tipo == TipoEvento::perdaPrazo && e.idTarefa == 2 && e.instante == 7) achou = true;
++        CHECK(achou);
++    }
++
++    // Terminar exatamente no prazo CUMPRE o prazo.
++    void testeTerminarNoPrazoNaoEhPerda()
++    {
++        Simulador s(cfg("EDF", 1), {tarefa(1, 4, 0, 4, 4)}, 1);   // usa 100% da CPU, termina em 4, prazo 4
++        CHECK(s.executarCompleto());
++        CHECK(contar(s, TipoEvento::perdaPrazo) == 0);
++    }
++
++    // Duração maior que o período: ativações se acumulam, nenhuma é descartada.
++    void testeSobrecarga()
++    {
++        Simulador s(cfg("EDF", 1), {tarefa(1, 5, 0, 7, 5)}, 1);
++        CHECK(s.executarCompleto());
++        CHECK(s.estadoAtual().tcbs[0].getExecucoes() == 10);
++        CHECK(ticksExecutados(s, 1) == 70);
++        CHECK(contar(s, TipoEvento::chegada, 1) == 10);
++        CHECK(contar(s, TipoEvento::perdaPrazo, 1) >= 1);
++    }
++
++    // Várias CPUs: CPU ociosa é desligada e o tempo desligada é contabilizado.
++    void testeMultiCpu()
++    {
++        Simulador s(cfg("EDF", 3), {tarefa(1, 10, 0, 2, 10)}, 1);
++        CHECK(s.executarCompleto());
++        CHECK(contar(s, TipoEvento::cpuDesligada) >= 2);      // CPUs 1 e 2 nunca tiveram o que fazer
++        CHECK(s.ticksDesligada(1) == s.tickAtual());
++        CHECK(s.ticksDesligada(2) == s.tickAtual());
++        CHECK(s.ticksDesligada(0) < s.tickAtual());
++    }
++
++    // Com mais tarefas do que CPUs, nenhuma CPU pode ficar desligada enquanto
++    // existe tarefa na fila de prontos (requisito 1.2).
++    void testeSemOciosidadeComFila()
++    {
++        Simulador s(cfg("EDF", 2),
++                    {tarefa(1, 10, 0, 4, 10), tarefa(2, 10, 0, 4, 10), tarefa(3, 10, 0, 4, 10)}, 1);
++        CHECK(s.executarCompleto());
++        // Nos 8 primeiros ticks há 3 tarefas para 2 CPUs: as duas CPUs ocupadas.
++        for (std::size_t t = 0; t < 4; t++)
++            for (int quem : s.traco()[t]) CHECK(quem != -1);
++    }
++
++    // Duas tarefas totalmente idênticas: o desempate é por sorteio e é registrado.
++    void testeSorteio()
++    {
++        Simulador s(cfg("EDF", 1), {tarefa(1, 10, 0, 2, 10), tarefa(2, 10, 0, 2, 10)}, 1);
++        CHECK(s.executarCompleto());
++        CHECK(contar(s, TipoEvento::sorteio) >= 1);
++        // Mesma semente => mesma simulação (reprodutível).
++        Simulador s2(cfg("EDF", 1), {tarefa(1, 10, 0, 2, 10), tarefa(2, 10, 0, 2, 10)}, 1);
++        s2.executarCompleto();
++        CHECK(s.traco() == s2.traco());
++    }
++
++    // Retroceder e avançar de novo reproduz exatamente a mesma simulação.
++    void testeRetrocederEAvancar()
++    {
++        Simulador s(cfg("EDF", 2),
++                    {tarefa(1, 5, 0, 2, 5), tarefa(2, 5, 0, 2, 5), tarefa(3, 7, 1, 3, 7)}, 7);
++        CHECK(s.executarCompleto());
++        const auto tracoFinal = s.traco();
++        const std::size_t eventosFinal = s.eventos().size();
++        const int fim = s.tickAtual();
++
++        for (int i = 0; i < 12; i++) CHECK(s.voltar());
++        CHECK(s.tickAtual() == fim - 12);
++        CHECK(s.numEventosVisiveis() <= eventosFinal);
++        CHECK(!s.terminou());
++        for (int i = 0; i < 12; i++) CHECK(s.passo());
++        CHECK(s.tickAtual() == fim);
++        CHECK(s.terminou());
++        CHECK(s.traco() == tracoFinal);
++        CHECK(s.eventos().size() == eventosFinal);
++        CHECK(s.numEventosVisiveis() == eventosFinal);
++
++        // Não dá para voltar além do instante 0.
++        while (s.voltar()) {}
++        CHECK(s.tickAtual() == 0);
++        CHECK(!s.voltar());
++    }
++
++    void testeEdicao()
++    {
++        Simulador s(cfg("EDF", 1), {tarefa(1, 10, 0, 6, 10)}, 1);
++        for (int i = 0; i < 3; i++) s.passo();       // tarefa 1 executou 3 de 6 ticks
++
++        CHECK(!s.editarTarefa(99, "duracao", 2).ok);                 // tarefa inexistente
++        CHECK(!s.editarTarefa(1, "tempo_restante", 0).ok);           // fora do intervalo
++        CHECK(!s.editarTarefa(1, "tempo_restante", 7).ok);           // maior que a duração
++        CHECK(!s.editarTarefa(1, "periodo", 0).ok);                  // aperiódica: só no Projeto B
++        CHECK(!s.editarTarefa(1, "ingresso", 5).ok);                 // já chegou ao sistema
++        CHECK(!s.editarTarefa(1, "banana", 5).ok);                   // campo inexistente
++        CHECK(!s.editarTarefa(1, "periodo", 2).ok);                  // próxima ativação cairia no passado
++
++        // Erros não podem ter alterado nada.
++        CHECK(s.estadoAtual().tcbs[0].getTempoRestante() == 3);
++
++        const ResultadoEdicao r = s.editarTarefa(1, "tempo_restante", 1);
++        CHECK(r.ok);
++        CHECK(s.tickAtual() == 3);
++        CHECK(s.executarCompleto());
++        CHECK(ticksExecutados(s, 1) == 3 + 1 + 9 * 6);               // 1ª ativação terminou antes
++
++        // Edição depois de retroceder descarta o futuro antigo.
++        Simulador q(cfg("EDF", 1), {tarefa(1, 10, 0, 4, 10)}, 1);
++        q.executarCompleto();
++        for (int i = 0; i < 5; i++) q.voltar();
++        const int t = q.tickAtual();
++        CHECK(q.passo());                                            // dá para reavançar (futuro guardado)
++        q.voltar();
++        CHECK(q.alterarAlgoritmo("rm").ok);
++        CHECK(!q.alterarAlgoritmo("fifo").ok);
++        CHECK(q.traco().size() == static_cast<std::size_t>(t));      // futuro descartado
++        CHECK(!q.alterarNumCpus(2).ok);                              // fora do instante 0
++        while (q.voltar()) {}
++        CHECK(q.alterarNumCpus(2).ok);
++        CHECK(q.executarCompleto());
++
++        // Encerrar uma tarefa à força.
++        Simulador e(cfg("EDF", 1), {tarefa(1, 5, 0, 2, 5), tarefa(2, 5, 0, 2, 5)}, 3);
++        e.passo();
++        CHECK(e.encerrarTarefa(2).ok);
++        CHECK(!e.encerrarTarefa(2).ok);
++        CHECK(e.executarCompleto());
++        CHECK(e.estadoAtual().tcbs[1].getExecucoes() == 0);
++    }
++
++    // O leitor deve ignorar (com aviso) tarefas aperiódicas, mesmo com prazo 0.
++    void testeLeitor()
++    {
++        LeitorConfig l;
++        const std::string ok = escreverArquivo("so_aperiodica_ok.txt",
++            "rm;2;2;\n1;FF0000;0;2;5;5;\n\n2 ; 00ff00 ; 1 ; 3 ; 10 ; 8\n3;0000FF;0;1;0;0\n");
++        CHECK(l.carregar(ok));
++        CHECK(l.getErros().empty());
++        CHECK(l.getTarefas().size() == 2);
++        CHECK(l.getAvisos().size() == 1);
++        CHECK(l.getConfiguracao().getAlgoritmo() == "RM");
++
++        const std::string ruim = escreverArquivo("erros.txt",
++            "XYZ;0;0\n1;FF0000;0;2;5;5\n1;00FF00;0;3;4;4\n3;GGGGGG;0;1;5;5\n4;FF00FF;0;1;-3;5\n5;FF00FF;0;1;5\n");
++        LeitorConfig l2;
++        CHECK(!l2.carregar(ruim));
++        CHECK(l2.getErros().size() >= 5);
++
++        LeitorConfig l3;
++        CHECK(!l3.carregar("/caminho/que/nao/existe.txt"));
++    }
++}
++
++int main()
++{
++    testeRmContraEdf();
++    testeInstanteDaPerdaDePrazo();
++    testeTerminarNoPrazoNaoEhPerda();
++    testeSobrecarga();
++    testeMultiCpu();
++    testeSemOciosidadeComFila();
++    testeSorteio();
++    testeRetrocederEAvancar();
++    testeEdicao();
++    testeLeitor();
++
++    if (falhas == 0) std::cout << "Todos os testes passaram.\n";
++    else std::cout << falhas << " verificacao(oes) falhou(aram).\n";
++    return falhas == 0 ? 0 : 1;
++}
