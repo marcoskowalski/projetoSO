@@ -14,4 +14,13 @@ add_executable(ProjetoSO src/main.cpp
         src/Configuracao.cpp
         headers/Configuracao.h
         src/LeitorConfig.cpp
-        headers/LeitorConfig.h)
+        headers/LeitorConfig.h
+        headers/TCB.h
+        src/EscalonadorRM.cpp
+        headers/EscalonadorRM.h
+        headers/EscalonadorEDF.h
+        src/EscalonadorEDF.cpp
+        headers/Escalonador.h
+        src/Escalonador.cpp
+        src/TCB.cpp
+        src/teste_escalonador.cpp)
